@@ -7,8 +7,9 @@ import { SubmitButton } from "@/components/submit-button";
 import { requireUser } from "@/lib/auth";
 import { getGroupOverview } from "@/lib/db";
 import { env } from "@/lib/env";
+import { buildInstallmentPlan } from "@/lib/installments";
 import { centsToAmountString, formatCurrencyFromCents, parseAmountToCents } from "@/lib/money";
-import { buildSettlementReminderMessage, joinAbsoluteUrl } from "@/lib/reminder";
+import { buildInstallmentReminderMessage, buildSettlementReminderMessage, joinAbsoluteUrl } from "@/lib/reminder";
 
 interface GroupPageProps {
   params: Promise<{ groupId: string }>;
@@ -21,6 +22,10 @@ function todayDate(): string {
 
 function isIsoDate(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function toReadableDate(value: string): string {
+  return new Date(value).toLocaleDateString("en-US", { dateStyle: "medium" });
 }
 
 export default async function GroupPage({ params, searchParams }: GroupPageProps) {
@@ -40,6 +45,7 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
   const settleTo = typeof search.settleTo === "string" ? search.settleTo.trim() : "";
   const settleAmount = typeof search.settleAmount === "string" ? search.settleAmount.trim() : "";
   const settleDate = typeof search.settleDate === "string" ? search.settleDate.trim() : "";
+  const settleNote = typeof search.settleNote === "string" ? search.settleNote.trim() : "";
 
   const defaultFromMemberId = memberIdSet.has(settleFrom) ? settleFrom : (overview.members[0]?.userId ?? "");
   const fallbackToMemberId =
@@ -59,14 +65,24 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
   }
 
   const defaultPaymentDate = settleDate && isIsoDate(settleDate) ? settleDate : todayDate();
-
-  function buildSettleHref(fromMemberId: string, toMemberId: string, amountCents: number): string {
+  const defaultNote = settleNote;
+  function buildSettleHref(input: {
+    fromMemberId: string;
+    toMemberId: string;
+    amountCents: number;
+    paymentDate?: string;
+    note?: string;
+  }): string {
     const settleQuery = new URLSearchParams({
-      settleFrom: fromMemberId,
-      settleTo: toMemberId,
-      settleAmount: centsToAmountString(amountCents),
-      settleDate: todayDate(),
+      settleFrom: input.fromMemberId,
+      settleTo: input.toMemberId,
+      settleAmount: centsToAmountString(input.amountCents),
+      settleDate: input.paymentDate && isIsoDate(input.paymentDate) ? input.paymentDate : todayDate(),
     });
+
+    if (input.note && input.note.trim().length > 0) {
+      settleQuery.set("settleNote", input.note.trim());
+    }
 
     return `/g/${groupId}?${settleQuery.toString()}#record-payment`;
   }
@@ -210,13 +226,54 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
                   const payerName = memberNameById.get(suggestion.fromMemberId) ?? "Unknown";
                   const payeeName = memberNameById.get(suggestion.toMemberId) ?? "Unknown";
                   const amountLabel = formatCurrencyFromCents(suggestion.amountCents, overview.group.currencyCode);
-                  const settleHref = buildSettleHref(suggestion.fromMemberId, suggestion.toMemberId, suggestion.amountCents);
+                  const settleHref = buildSettleHref({
+                    fromMemberId: suggestion.fromMemberId,
+                    toMemberId: suggestion.toMemberId,
+                    amountCents: suggestion.amountCents,
+                  });
                   const reminderMessage = buildSettlementReminderMessage({
                     payerName,
                     payeeName,
                     amountLabel,
                     groupName: overview.group.name,
                     settleLink: joinAbsoluteUrl(env.siteUrl(), settleHref),
+                  });
+                  const installmentPlans = [2, 3, 4].map((parts) => {
+                    const plan = buildInstallmentPlan(suggestion.amountCents, parts, todayDate());
+                    const first = plan[0];
+                    if (!first) {
+                      throw new Error("Invalid installment plan.");
+                    }
+
+                    const planSummary = plan
+                      .map(
+                        (entry) =>
+                          `${entry.index}) ${formatCurrencyFromCents(entry.amountCents, overview.group.currencyCode)} on ${toReadableDate(entry.dueDate)}`,
+                      )
+                      .join("; ");
+                    const installmentNote = `Installment 1/${parts} of ${amountLabel} settlement`;
+                    const firstInstallmentHref = buildSettleHref({
+                      fromMemberId: suggestion.fromMemberId,
+                      toMemberId: suggestion.toMemberId,
+                      amountCents: first.amountCents,
+                      paymentDate: first.dueDate,
+                      note: installmentNote,
+                    });
+                    const installmentReminderMessage = buildInstallmentReminderMessage({
+                      payerName,
+                      payeeName,
+                      totalAmountLabel: amountLabel,
+                      groupName: overview.group.name,
+                      planSummary,
+                      firstSettleLink: joinAbsoluteUrl(env.siteUrl(), firstInstallmentHref),
+                    });
+
+                    return {
+                      parts,
+                      planSummary,
+                      firstInstallmentHref,
+                      installmentReminderMessage,
+                    };
                   });
 
                   return (
@@ -235,6 +292,26 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
                         </Link>
                       </div>
                       <ReminderActions message={reminderMessage} className="mt-2" />
+
+                      <div className="mt-2 rounded-md bg-slate-50 p-2">
+                        <p className="text-xs font-medium text-slate-700">Need flexibility? Start a weekly payment plan:</p>
+                        <ul className="mt-2 space-y-2">
+                          {installmentPlans.map((option) => (
+                            <li key={option.parts} className="rounded-md border border-slate-200 bg-white px-2 py-1.5">
+                              <p className="text-xs text-slate-600">{option.planSummary}</p>
+                              <div className="mt-1 flex flex-wrap items-center gap-2">
+                                <Link
+                                  href={option.firstInstallmentHref}
+                                  className="rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                                >
+                                  Start {option.parts}-part plan
+                                </Link>
+                                <ReminderActions message={option.installmentReminderMessage} />
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
                     </li>
                   );
                 })}
@@ -322,7 +399,7 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
 
               <label className="space-y-1 block">
                 <span className="text-sm text-slate-700">Note (optional)</span>
-                <input name="note" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                <input name="note" defaultValue={defaultNote} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
               </label>
 
               <SubmitButton

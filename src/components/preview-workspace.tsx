@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { ExpenseForm } from "@/components/expense-form";
 import { ReminderActions } from "@/components/reminder-actions";
 import { computeGroupBalances } from "@/lib/balances";
+import { buildInstallmentPlan } from "@/lib/installments";
 import { centsToAmountString, formatCurrencyFromCents, parseAmountToCents } from "@/lib/money";
 import {
   PREVIEW_STORAGE_KEY,
@@ -12,7 +13,7 @@ import {
   type PreviewExpense,
   type PreviewGroup,
 } from "@/lib/preview";
-import { buildSettlementReminderMessage, joinAbsoluteUrl } from "@/lib/reminder";
+import { buildInstallmentReminderMessage, buildSettlementReminderMessage, joinAbsoluteUrl } from "@/lib/reminder";
 import { suggestSettlements } from "@/lib/settle";
 import { computeExpenseSplit } from "@/lib/splits";
 import type { ExpensePayload } from "@/types/app";
@@ -25,13 +26,27 @@ function isIsoDate(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
 
-function buildSettleHref(fromMemberId: string, toMemberId: string, amountCents: number): string {
+function toReadableDate(value: string): string {
+  return new Date(value).toLocaleDateString("en-US", { dateStyle: "medium" });
+}
+
+function buildSettleHref(input: {
+  fromMemberId: string;
+  toMemberId: string;
+  amountCents: number;
+  paymentDate?: string;
+  note?: string;
+}): string {
   const settleQuery = new URLSearchParams({
-    settleFrom: fromMemberId,
-    settleTo: toMemberId,
-    settleAmount: centsToAmountString(amountCents),
-    settleDate: todayDate(),
+    settleFrom: input.fromMemberId,
+    settleTo: input.toMemberId,
+    settleAmount: centsToAmountString(input.amountCents),
+    settleDate: input.paymentDate && isIsoDate(input.paymentDate) ? input.paymentDate : todayDate(),
   });
+
+  if (input.note && input.note.trim().length > 0) {
+    settleQuery.set("settleNote", input.note.trim());
+  }
 
   return `/?${settleQuery.toString()}#record-payment`;
 }
@@ -478,7 +493,8 @@ export function PreviewWorkspace() {
     const settleTo = searchParams.get("settleTo")?.trim() ?? "";
     const settleAmount = searchParams.get("settleAmount")?.trim() ?? "";
     const settleDate = searchParams.get("settleDate")?.trim() ?? "";
-    const hasSettleParams = Boolean(settleFrom || settleTo || settleAmount || settleDate);
+    const settleNote = searchParams.get("settleNote")?.trim() ?? "";
+    const hasSettleParams = Boolean(settleFrom || settleTo || settleAmount || settleDate || settleNote);
 
     if (!hasSettleParams) {
       setDidApplySettleParams(true);
@@ -506,6 +522,10 @@ export function PreviewWorkspace() {
 
     if (settleDate && isIsoDate(settleDate)) {
       setPaymentDate(settleDate);
+    }
+
+    if (settleNote) {
+      setPaymentNote(settleNote);
     }
 
     setPaymentError(null);
@@ -1204,13 +1224,54 @@ export function PreviewWorkspace() {
                   const payerName = memberNameById(group, suggestion.fromMemberId);
                   const payeeName = memberNameById(group, suggestion.toMemberId);
                   const amountLabel = formatCurrencyFromCents(suggestion.amountCents, group.currencyCode);
-                  const settleHref = buildSettleHref(suggestion.fromMemberId, suggestion.toMemberId, suggestion.amountCents);
+                  const settleHref = buildSettleHref({
+                    fromMemberId: suggestion.fromMemberId,
+                    toMemberId: suggestion.toMemberId,
+                    amountCents: suggestion.amountCents,
+                  });
                   const reminderMessage = buildSettlementReminderMessage({
                     payerName,
                     payeeName,
                     amountLabel,
                     groupName: group.name,
                     settleLink: joinAbsoluteUrl(publicBaseUrl, settleHref),
+                  });
+                  const installmentPlans = [2, 3, 4].map((parts) => {
+                    const plan = buildInstallmentPlan(suggestion.amountCents, parts, todayDate());
+                    const first = plan[0];
+                    if (!first) {
+                      throw new Error("Invalid installment plan.");
+                    }
+
+                    const planSummary = plan
+                      .map(
+                        (entry) =>
+                          `${entry.index}) ${formatCurrencyFromCents(entry.amountCents, group.currencyCode)} on ${toReadableDate(entry.dueDate)}`,
+                      )
+                      .join("; ");
+                    const installmentNote = `Installment 1/${parts} of ${amountLabel} settlement`;
+                    const firstInstallmentHref = buildSettleHref({
+                      fromMemberId: suggestion.fromMemberId,
+                      toMemberId: suggestion.toMemberId,
+                      amountCents: first.amountCents,
+                      paymentDate: first.dueDate,
+                      note: installmentNote,
+                    });
+                    const installmentReminderMessage = buildInstallmentReminderMessage({
+                      payerName,
+                      payeeName,
+                      totalAmountLabel: amountLabel,
+                      groupName: group.name,
+                      planSummary,
+                      firstSettleLink: joinAbsoluteUrl(publicBaseUrl, firstInstallmentHref),
+                    });
+
+                    return {
+                      parts,
+                      planSummary,
+                      firstInstallmentHref,
+                      installmentReminderMessage,
+                    };
                   });
 
                   return (
@@ -1232,6 +1293,26 @@ export function PreviewWorkspace() {
                         </a>
                       </div>
                       <ReminderActions message={reminderMessage} className="mt-2" />
+
+                      <div className="mt-2 rounded-md bg-slate-50 p-2">
+                        <p className="text-xs font-medium text-slate-700">Need flexibility? Start a weekly payment plan:</p>
+                        <ul className="mt-2 space-y-2">
+                          {installmentPlans.map((option) => (
+                            <li key={option.parts} className="rounded-md border border-slate-200 bg-white px-2 py-1.5">
+                              <p className="text-xs text-slate-600">{option.planSummary}</p>
+                              <div className="mt-1 flex flex-wrap items-center gap-2">
+                                <a
+                                  href={option.firstInstallmentHref}
+                                  className="rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                                >
+                                  Start {option.parts}-part plan
+                                </a>
+                                <ReminderActions message={option.installmentReminderMessage} />
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
                     </li>
                   );
                 })}

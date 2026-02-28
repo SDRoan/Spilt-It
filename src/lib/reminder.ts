@@ -6,8 +6,21 @@ interface SettlementReminderInput {
   settleLink: string;
 }
 
+interface InstallmentReminderInput {
+  payerName: string;
+  payeeName: string;
+  totalAmountLabel: string;
+  groupName: string;
+  planSummary: string;
+  firstSettleLink: string;
+}
+
 export function buildSettlementReminderMessage(input: SettlementReminderInput): string {
   return `Hi ${input.payerName}, quick reminder from Split It: please pay ${input.payeeName} ${input.amountLabel} for "${input.groupName}". Mark it as paid here: ${input.settleLink}`;
+}
+
+export function buildInstallmentReminderMessage(input: InstallmentReminderInput): string {
+  return `Hi ${input.payerName}, to make this easier, here is a payment plan for "${input.groupName}" (${input.totalAmountLabel} total) to ${input.payeeName}: ${input.planSummary}. Record installment 1 here: ${input.firstSettleLink}`;
 }
 
 export function buildWhatsAppShareUrl(message: string): string {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildInstallmentReminderMessage,
   buildSettlementReminderMessage,
   buildSmsShareUrl,
   buildWhatsAppShareUrl,
@@ -22,6 +23,22 @@ describe("reminder helpers", () => {
     expect(message).toContain("$10.00");
     expect(message).toContain("Trip");
     expect(message).toContain("https://split-it.app/g/1?settle=true");
+  });
+
+  it("builds an installment reminder message with plan summary", () => {
+    const message = buildInstallmentReminderMessage({
+      payerName: "Jordan",
+      payeeName: "KT",
+      totalAmountLabel: "$10.00",
+      groupName: "Trip",
+      planSummary: "1) $5.00 on Feb 28, 2026; 2) $5.00 on Mar 7, 2026",
+      firstSettleLink: "https://split-it.app/g/1?settle=installment",
+    });
+
+    expect(message).toContain("payment plan");
+    expect(message).toContain("$10.00");
+    expect(message).toContain("1) $5.00 on Feb 28, 2026");
+    expect(message).toContain("https://split-it.app/g/1?settle=installment");
   });
 
   it("builds share URLs for WhatsApp and SMS", () => {
