@@ -5,10 +5,18 @@ import { useEffect, useMemo, useState } from "react";
 import { ExpenseForm } from "@/components/expense-form";
 import { ReminderActions } from "@/components/reminder-actions";
 import { computeGroupBalances } from "@/lib/balances";
+import {
+  buildExpenseBalanceDelta,
+  buildWeeklyActionPlan,
+  computeMonthlyShareSpend,
+  computeResponsibilityScore,
+  monthKeyFromDate,
+} from "@/lib/financial-coach";
 import { buildInstallmentPlan } from "@/lib/installments";
 import { centsToAmountString, formatCurrencyFromCents, parseAmountToCents } from "@/lib/money";
 import {
   PREVIEW_STORAGE_KEY,
+  type FinancialCoachSettings,
   getDefaultPreviewGroup,
   type PreviewExpense,
   type PreviewGroup,
@@ -17,6 +25,12 @@ import { buildInstallmentReminderMessage, buildSettlementReminderMessage, joinAb
 import { suggestSettlements } from "@/lib/settle";
 import { computeExpenseSplit } from "@/lib/splits";
 import type { ExpensePayload } from "@/types/app";
+
+const DEFAULT_COACH_SETTINGS: FinancialCoachSettings = {
+  monthlyBudgetCents: 60000,
+  maxDebtCents: 20000,
+  weeklyPayCapCents: 5000,
+};
 
 function todayDate(): string {
   return new Date().toISOString().slice(0, 10);
@@ -69,6 +83,25 @@ function toMemberId(input: string): string {
 
 function memberNameById(group: PreviewGroup, userId: string): string {
   return group.members.find((member) => member.userId === userId)?.displayName ?? "Unknown";
+}
+
+function getCoachSettingsForMember(group: PreviewGroup, memberId: string): FinancialCoachSettings {
+  const raw = group.financialCoachByMember?.[memberId];
+
+  return {
+    monthlyBudgetCents:
+      raw && Number.isInteger(raw.monthlyBudgetCents) && raw.monthlyBudgetCents > 0
+        ? raw.monthlyBudgetCents
+        : DEFAULT_COACH_SETTINGS.monthlyBudgetCents,
+    maxDebtCents:
+      raw && Number.isInteger(raw.maxDebtCents) && raw.maxDebtCents > 0
+        ? raw.maxDebtCents
+        : DEFAULT_COACH_SETTINGS.maxDebtCents,
+    weeklyPayCapCents:
+      raw && Number.isInteger(raw.weeklyPayCapCents) && raw.weeklyPayCapCents > 0
+        ? raw.weeklyPayCapCents
+        : DEFAULT_COACH_SETTINGS.weeklyPayCapCents,
+  };
 }
 
 function splitTotals(expense: PreviewExpense): Record<string, number> {
@@ -442,13 +475,27 @@ export function PreviewWorkspace() {
   const [didApplySettleParams, setDidApplySettleParams] = useState(false);
   const [publicBaseUrl, setPublicBaseUrl] = useState("http://localhost:3000");
 
+  const [coachMemberId, setCoachMemberId] = useState(group.members[0]?.userId ?? "");
+  const [coachMonthlyBudget, setCoachMonthlyBudget] = useState(
+    centsToAmountString(DEFAULT_COACH_SETTINGS.monthlyBudgetCents),
+  );
+  const [coachMaxDebt, setCoachMaxDebt] = useState(centsToAmountString(DEFAULT_COACH_SETTINGS.maxDebtCents));
+  const [coachWeeklyPayCap, setCoachWeeklyPayCap] = useState(
+    centsToAmountString(DEFAULT_COACH_SETTINGS.weeklyPayCapCents),
+  );
+  const [coachError, setCoachError] = useState<string | null>(null);
+  const [coachStatus, setCoachStatus] = useState<string | null>(null);
+
   useEffect(() => {
     try {
       const stored = window.localStorage.getItem(PREVIEW_STORAGE_KEY);
       if (stored) {
         const parsed = JSON.parse(stored) as PreviewGroup;
         if (parsed && Array.isArray(parsed.members) && Array.isArray(parsed.expenses) && Array.isArray(parsed.payments)) {
-          setGroup(parsed);
+          setGroup({
+            ...parsed,
+            financialCoachByMember: parsed.financialCoachByMember ?? {},
+          });
         }
       }
     } catch {
@@ -481,7 +528,37 @@ export function PreviewWorkspace() {
       const fallback = group.members.find((member) => member.userId !== paymentFrom)?.userId;
       setPaymentTo(fallback ?? group.members[0]?.userId ?? "");
     }
-  }, [group.members, paymentFrom, paymentTo]);
+
+    if (!memberIds.has(coachMemberId)) {
+      setCoachMemberId(group.members[0]?.userId ?? "");
+    }
+  }, [coachMemberId, group.members, paymentFrom, paymentTo]);
+
+  useEffect(() => {
+    if (!coachMemberId) {
+      return;
+    }
+
+    const raw = group.financialCoachByMember?.[coachMemberId];
+    const nextSettings: FinancialCoachSettings = {
+      monthlyBudgetCents:
+        raw && Number.isInteger(raw.monthlyBudgetCents) && raw.monthlyBudgetCents > 0
+          ? raw.monthlyBudgetCents
+          : DEFAULT_COACH_SETTINGS.monthlyBudgetCents,
+      maxDebtCents:
+        raw && Number.isInteger(raw.maxDebtCents) && raw.maxDebtCents > 0
+          ? raw.maxDebtCents
+          : DEFAULT_COACH_SETTINGS.maxDebtCents,
+      weeklyPayCapCents:
+        raw && Number.isInteger(raw.weeklyPayCapCents) && raw.weeklyPayCapCents > 0
+          ? raw.weeklyPayCapCents
+          : DEFAULT_COACH_SETTINGS.weeklyPayCapCents,
+    };
+
+    setCoachMonthlyBudget(centsToAmountString(nextSettings.monthlyBudgetCents));
+    setCoachMaxDebt(centsToAmountString(nextSettings.maxDebtCents));
+    setCoachWeeklyPayCap(centsToAmountString(nextSettings.weeklyPayCapCents));
+  }, [coachMemberId, group.financialCoachByMember]);
 
   useEffect(() => {
     if (!loaded || didApplySettleParams) {
@@ -594,6 +671,79 @@ export function PreviewWorkspace() {
     ? group.expenses.find((expense) => expense.id === receiptExpenseId) ?? null
     : null;
 
+  const monthKey = monthKeyFromDate(todayDate());
+  const selectedCoachSettings = coachMemberId
+    ? getCoachSettingsForMember(group, coachMemberId)
+    : DEFAULT_COACH_SETTINGS;
+  const monthlyShareSpendCents = coachMemberId
+    ? computeMonthlyShareSpend(group.expenses, coachMemberId, monthKey)
+    : 0;
+  const coachBalanceCents = coachMemberId ? (balances[coachMemberId] ?? 0) : 0;
+  const owedCents = Math.max(0, -coachBalanceCents);
+  const recentOutgoingPayments = coachMemberId
+    ? group.payments.filter((payment) => {
+        if (payment.fromMemberId !== coachMemberId) {
+          return false;
+        }
+
+        const paymentDate = new Date(`${payment.paymentDate}T00:00:00Z`);
+        const cutoff = new Date(`${todayDate()}T00:00:00Z`);
+        cutoff.setUTCDate(cutoff.getUTCDate() - 30);
+        return paymentDate >= cutoff;
+      }).length
+    : 0;
+  const responsibilityScore = computeResponsibilityScore({
+    owedCents,
+    maxDebtCents: selectedCoachSettings.maxDebtCents,
+    monthlyShareSpendCents,
+    monthlyBudgetCents: selectedCoachSettings.monthlyBudgetCents,
+    recentOutgoingPaymentsCount: recentOutgoingPayments,
+  });
+  const weeklyPlan = buildWeeklyActionPlan(owedCents, selectedCoachSettings.weeklyPayCapCents, todayDate());
+  const monthlyUsagePercent =
+    selectedCoachSettings.monthlyBudgetCents > 0
+      ? Math.round((monthlyShareSpendCents / selectedCoachSettings.monthlyBudgetCents) * 100)
+      : 0;
+  const scoreToneClass =
+    responsibilityScore >= 80
+      ? "text-emerald-700"
+      : responsibilityScore >= 60
+        ? "text-amber-700"
+        : "text-rose-700";
+
+  function handleSaveCoachSettings(event: React.FormEvent<HTMLFormElement>): void {
+    event.preventDefault();
+    setCoachError(null);
+    setCoachStatus(null);
+
+    try {
+      if (!coachMemberId) {
+        throw new Error("Select a member first.");
+      }
+
+      const monthlyBudgetCents = parseAmountToCents(coachMonthlyBudget);
+      const maxDebtCents = parseAmountToCents(coachMaxDebt);
+      const weeklyPayCapCents = parseAmountToCents(coachWeeklyPayCap);
+
+      setGroup((current) => ({
+        ...current,
+        financialCoachByMember: {
+          ...(current.financialCoachByMember ?? {}),
+          [coachMemberId]: {
+            monthlyBudgetCents,
+            maxDebtCents,
+            weeklyPayCapCents,
+          },
+        },
+      }));
+
+      setCoachStatus("Financial guardrails saved.");
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "Could not save coach settings.";
+      setCoachError(message);
+    }
+  }
+
   async function handleSaveExpense(formData: FormData): Promise<void> {
     const payload = parsePayloadFromForm(formData);
 
@@ -703,6 +853,57 @@ export function PreviewWorkspace() {
     const expenseId = editingExpenseId ?? makeId("exp");
     const existingExpense = group.expenses.find((expense) => expense.id === expenseId);
 
+    const nextSplits = computed.splitRows.map((split) => ({
+      participantId: split.memberId,
+      amountCents: split.amountCents,
+      itemId:
+        typeof split.itemIndex === "number" && payload.mode === "itemized"
+          ? (itemIdsByIndex[split.itemIndex] ?? null)
+          : null,
+    }));
+
+    const newDelta = buildExpenseBalanceDelta(payload.paidBy, computed.totalCents, nextSplits);
+    const oldDelta = existingExpense
+      ? buildExpenseBalanceDelta(existingExpense.paidBy, existingExpense.totalCents, existingExpense.splits)
+      : {};
+
+    const guardViolations: string[] = [];
+
+    for (const member of group.members) {
+      if (!group.financialCoachByMember?.[member.userId]) {
+        continue;
+      }
+
+      const settings = getCoachSettingsForMember(group, member.userId);
+      const projectedBalance = (balances[member.userId] ?? 0) + (newDelta[member.userId] ?? 0) - (oldDelta[member.userId] ?? 0);
+      const projectedDebt = Math.max(0, -projectedBalance);
+
+      if (projectedDebt > settings.maxDebtCents) {
+        guardViolations.push(
+          `Budget guard: ${member.displayName} would owe ${formatCurrencyFromCents(projectedDebt, group.currencyCode)} (limit ${formatCurrencyFromCents(settings.maxDebtCents, group.currencyCode)}).`,
+        );
+      }
+
+      const month = payload.date.slice(0, 7);
+      const expensesWithoutEditing = group.expenses.filter((expense) => expense.id !== expenseId);
+      const currentMonthShareSpend = computeMonthlyShareSpend(expensesWithoutEditing, member.userId, month);
+      const nextMemberShare = nextSplits.reduce(
+        (sum, split) => (split.participantId === member.userId ? sum + split.amountCents : sum),
+        0,
+      );
+      const projectedMonthShareSpend = currentMonthShareSpend + nextMemberShare;
+
+      if (projectedMonthShareSpend > settings.monthlyBudgetCents) {
+        guardViolations.push(
+          `Budget guard: ${member.displayName}'s monthly share would become ${formatCurrencyFromCents(projectedMonthShareSpend, group.currencyCode)} (budget ${formatCurrencyFromCents(settings.monthlyBudgetCents, group.currencyCode)}).`,
+        );
+      }
+    }
+
+    if (guardViolations.length > 0) {
+      throw new Error(guardViolations[0]);
+    }
+
     const nextExpense: PreviewExpense = {
       id: expenseId,
       description: payload.description,
@@ -713,14 +914,7 @@ export function PreviewWorkspace() {
       notes: payload.notes ?? null,
       splitMode: payload.mode,
       items,
-      splits: computed.splitRows.map((split) => ({
-        participantId: split.memberId,
-        amountCents: split.amountCents,
-        itemId:
-          typeof split.itemIndex === "number" && payload.mode === "itemized"
-            ? (itemIdsByIndex[split.itemIndex] ?? null)
-            : null,
-      })),
+      splits: nextSplits,
       createdAt: existingExpense?.createdAt ?? new Date().toISOString(),
     };
 
@@ -935,6 +1129,12 @@ export function PreviewWorkspace() {
     setReceiptFooter("");
     setReceiptError(null);
     setReceiptStatus(null);
+    setCoachMemberId(defaults.members[0]?.userId ?? "");
+    setCoachMonthlyBudget(centsToAmountString(DEFAULT_COACH_SETTINGS.monthlyBudgetCents));
+    setCoachMaxDebt(centsToAmountString(DEFAULT_COACH_SETTINGS.maxDebtCents));
+    setCoachWeeklyPayCap(centsToAmountString(DEFAULT_COACH_SETTINGS.weeklyPayCapCents));
+    setCoachError(null);
+    setCoachStatus(null);
     window.localStorage.removeItem(PREVIEW_STORAGE_KEY);
   }
 
@@ -1195,6 +1395,110 @@ export function PreviewWorkspace() {
         </div>
 
         <div className="space-y-6">
+          <article className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h2 className="text-lg font-semibold text-slate-900">Financial coach</h2>
+            <p className="mt-2 text-sm text-slate-600">
+              Set personal limits to build disciplined spending and repayment habits.
+            </p>
+
+            {group.members.length === 0 ? (
+              <p className="mt-3 text-sm text-slate-600">Add members to configure financial guardrails.</p>
+            ) : (
+              <form onSubmit={handleSaveCoachSettings} className="mt-3 space-y-3">
+                <label className="space-y-1 block">
+                  <span className="text-sm text-slate-700">Member</span>
+                  <select
+                    value={coachMemberId}
+                    onChange={(event) => setCoachMemberId(event.target.value)}
+                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                  >
+                    {group.members.map((member) => (
+                      <option key={member.userId} value={member.userId}>
+                        {member.displayName}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="space-y-1 block">
+                  <span className="text-sm text-slate-700">Monthly spend budget ({group.currencyCode})</span>
+                  <input
+                    value={coachMonthlyBudget}
+                    onChange={(event) => setCoachMonthlyBudget(event.target.value)}
+                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                    placeholder="0.00"
+                  />
+                </label>
+
+                <label className="space-y-1 block">
+                  <span className="text-sm text-slate-700">Max safe debt ({group.currencyCode})</span>
+                  <input
+                    value={coachMaxDebt}
+                    onChange={(event) => setCoachMaxDebt(event.target.value)}
+                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                    placeholder="0.00"
+                  />
+                </label>
+
+                <label className="space-y-1 block">
+                  <span className="text-sm text-slate-700">Weekly pay cap ({group.currencyCode})</span>
+                  <input
+                    value={coachWeeklyPayCap}
+                    onChange={(event) => setCoachWeeklyPayCap(event.target.value)}
+                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                    placeholder="0.00"
+                  />
+                </label>
+
+                {coachError ? <p className="text-sm text-rose-700">{coachError}</p> : null}
+                {coachStatus ? <p className="text-sm text-emerald-700">{coachStatus}</p> : null}
+
+                <button
+                  type="submit"
+                  className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-50"
+                >
+                  Save guardrails
+                </button>
+              </form>
+            )}
+
+            {coachMemberId ? (
+              <div className="mt-3 rounded-md bg-slate-50 p-3 text-sm">
+                <p className="text-slate-700">
+                  This month spend:{" "}
+                  <span className="font-semibold">
+                    {formatCurrencyFromCents(monthlyShareSpendCents, group.currencyCode)}
+                  </span>{" "}
+                  ({monthlyUsagePercent}% of budget)
+                </p>
+                <p className="mt-1 text-slate-700">
+                  Current owed:{" "}
+                  <span className="font-semibold">{formatCurrencyFromCents(owedCents, group.currencyCode)}</span>{" "}
+                  / safe debt{" "}
+                  <span className="font-semibold">
+                    {formatCurrencyFromCents(selectedCoachSettings.maxDebtCents, group.currencyCode)}
+                  </span>
+                </p>
+                <p className={`mt-1 font-semibold ${scoreToneClass}`}>Responsibility score: {responsibilityScore}/100</p>
+                {owedCents > 0 ? (
+                  <p className="mt-1 text-slate-700">
+                    Weekly action: pay{" "}
+                    <span className="font-semibold">
+                      {formatCurrencyFromCents(weeklyPlan.recommendedPaymentCents, group.currencyCode)}
+                    </span>{" "}
+                    by {new Date(weeklyPlan.dueDate).toLocaleDateString("en-US", { dateStyle: "medium" })}. At this pace, clear debt in{" "}
+                    <span className="font-semibold">{weeklyPlan.weeksToClear}</span> week
+                    {weeklyPlan.weeksToClear === 1 ? "" : "s"}.
+                  </p>
+                ) : (
+                  <p className="mt-1 text-slate-700">
+                    Weekly action: no debt right now. Keep spending under budget and keep your streak.
+                  </p>
+                )}
+              </div>
+            ) : null}
+          </article>
+
           <article className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
             <h2 className="text-lg font-semibold text-slate-900">Balances</h2>
             <ul className="mt-3 space-y-2 text-sm">

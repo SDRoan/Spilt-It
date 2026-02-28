@@ -5,6 +5,12 @@ export interface PreviewMember {
   displayName: string;
 }
 
+export interface FinancialCoachSettings {
+  monthlyBudgetCents: number;
+  maxDebtCents: number;
+  weeklyPayCapCents: number;
+}
+
 export interface PreviewExpenseItem {
   id: string;
   name: string;
@@ -48,6 +54,7 @@ export interface PreviewGroup {
   members: PreviewMember[];
   expenses: PreviewExpense[];
   payments: PreviewPayment[];
+  financialCoachByMember: Record<string, FinancialCoachSettings>;
 }
 
 export const PREVIEW_STORAGE_KEY = "billssplit_lite_preview_v2";
@@ -59,6 +66,7 @@ const DEFAULT_PREVIEW_GROUP: PreviewGroup = {
   members: [],
   expenses: [],
   payments: [],
+  financialCoachByMember: {},
 };
 
 export function getDefaultPreviewGroup(): PreviewGroup {
