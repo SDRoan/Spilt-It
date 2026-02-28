@@ -6,7 +6,7 @@ import { SubmitButton } from "@/components/submit-button";
 import { requireUser } from "@/lib/auth";
 import { getGroupOverview } from "@/lib/db";
 import { env } from "@/lib/env";
-import { formatCurrencyFromCents } from "@/lib/money";
+import { centsToAmountString, formatCurrencyFromCents, parseAmountToCents } from "@/lib/money";
 
 interface GroupPageProps {
   params: Promise<{ groupId: string }>;
@@ -15,6 +15,10 @@ interface GroupPageProps {
 
 function todayDate(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+function isIsoDate(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
 
 export default async function GroupPage({ params, searchParams }: GroupPageProps) {
@@ -28,6 +32,42 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
 
   const inviteToken = typeof search.invite === "string" ? search.invite : null;
   const inviteLink = inviteToken ? `${env.siteUrl()}/invite/${inviteToken}` : null;
+  const memberIdSet = new Set(overview.members.map((member) => member.userId));
+
+  const settleFrom = typeof search.settleFrom === "string" ? search.settleFrom.trim() : "";
+  const settleTo = typeof search.settleTo === "string" ? search.settleTo.trim() : "";
+  const settleAmount = typeof search.settleAmount === "string" ? search.settleAmount.trim() : "";
+  const settleDate = typeof search.settleDate === "string" ? search.settleDate.trim() : "";
+
+  const defaultFromMemberId = memberIdSet.has(settleFrom) ? settleFrom : (overview.members[0]?.userId ?? "");
+  const fallbackToMemberId =
+    overview.members.find((member) => member.userId !== defaultFromMemberId)?.userId ??
+    (overview.members[0]?.userId ?? "");
+  const defaultToMemberId =
+    memberIdSet.has(settleTo) && settleTo !== defaultFromMemberId ? settleTo : fallbackToMemberId;
+
+  let defaultAmount = "";
+  if (settleAmount) {
+    try {
+      parseAmountToCents(settleAmount);
+      defaultAmount = settleAmount;
+    } catch {
+      defaultAmount = "";
+    }
+  }
+
+  const defaultPaymentDate = settleDate && isIsoDate(settleDate) ? settleDate : todayDate();
+
+  function buildSettleHref(fromMemberId: string, toMemberId: string, amountCents: number): string {
+    const settleQuery = new URLSearchParams({
+      settleFrom: fromMemberId,
+      settleTo: toMemberId,
+      settleAmount: centsToAmountString(amountCents),
+      settleDate: todayDate(),
+    });
+
+    return `/g/${groupId}?${settleQuery.toString()}#record-payment`;
+  }
 
   return (
     <main className="mx-auto w-full max-w-6xl px-6 py-8">
@@ -166,11 +206,21 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
               <ul className="mt-3 space-y-2 text-sm">
                 {overview.suggestions.map((suggestion, index) => (
                   <li key={`${suggestion.fromMemberId}-${suggestion.toMemberId}-${index}`} className="rounded-md border border-slate-200 px-3 py-2">
-                    <span className="font-medium">{memberNameById.get(suggestion.fromMemberId) ?? "Unknown"}</span> pays{" "}
-                    <span className="font-medium">{memberNameById.get(suggestion.toMemberId) ?? "Unknown"}</span>{" "}
-                    <span className="font-semibold text-slate-900">
-                      {formatCurrencyFromCents(suggestion.amountCents, overview.group.currencyCode)}
-                    </span>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p>
+                        <span className="font-medium">{memberNameById.get(suggestion.fromMemberId) ?? "Unknown"}</span> pays{" "}
+                        <span className="font-medium">{memberNameById.get(suggestion.toMemberId) ?? "Unknown"}</span>{" "}
+                        <span className="font-semibold text-slate-900">
+                          {formatCurrencyFromCents(suggestion.amountCents, overview.group.currencyCode)}
+                        </span>
+                      </p>
+                      <Link
+                        href={buildSettleHref(suggestion.fromMemberId, suggestion.toMemberId, suggestion.amountCents)}
+                        className="rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                      >
+                        Settle now
+                      </Link>
+                    </div>
                   </li>
                 ))}
               </ul>
@@ -196,14 +246,19 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
             ) : null}
           </article>
 
-          <article className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <article id="record-payment" className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
             <h2 className="text-lg font-semibold text-slate-900">Record payment</h2>
             <form action={createPaymentAction} className="mt-3 space-y-3">
               <input type="hidden" name="groupId" value={groupId} />
 
               <label className="space-y-1 block">
                 <span className="text-sm text-slate-700">From</span>
-                <select name="fromMemberId" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" required>
+                <select
+                  name="fromMemberId"
+                  defaultValue={defaultFromMemberId}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                  required
+                >
                   {overview.members.map((member) => (
                     <option key={member.userId} value={member.userId}>
                       {member.displayName}
@@ -214,7 +269,12 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
 
               <label className="space-y-1 block">
                 <span className="text-sm text-slate-700">To</span>
-                <select name="toMemberId" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" required>
+                <select
+                  name="toMemberId"
+                  defaultValue={defaultToMemberId}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                  required
+                >
                   {overview.members.map((member) => (
                     <option key={member.userId} value={member.userId}>
                       {member.displayName}
@@ -225,7 +285,13 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
 
               <label className="space-y-1 block">
                 <span className="text-sm text-slate-700">Amount ({overview.group.currencyCode})</span>
-                <input name="amount" placeholder="0.00" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" required />
+                <input
+                  name="amount"
+                  defaultValue={defaultAmount}
+                  placeholder="0.00"
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                  required
+                />
               </label>
 
               <label className="space-y-1 block">
@@ -233,7 +299,7 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
                 <input
                   type="date"
                   name="paymentDate"
-                  defaultValue={todayDate()}
+                  defaultValue={defaultPaymentDate}
                   className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
                   required
                 />

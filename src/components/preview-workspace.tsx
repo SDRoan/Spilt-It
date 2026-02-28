@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { ExpenseForm } from "@/components/expense-form";
 import { computeGroupBalances } from "@/lib/balances";
-import { formatCurrencyFromCents, parseAmountToCents } from "@/lib/money";
+import { centsToAmountString, formatCurrencyFromCents, parseAmountToCents } from "@/lib/money";
 import {
   PREVIEW_STORAGE_KEY,
   getDefaultPreviewGroup,
@@ -17,6 +17,21 @@ import type { ExpensePayload } from "@/types/app";
 
 function todayDate(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+function isIsoDate(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function buildSettleHref(fromMemberId: string, toMemberId: string, amountCents: number): string {
+  const settleQuery = new URLSearchParams({
+    settleFrom: fromMemberId,
+    settleTo: toMemberId,
+    settleAmount: centsToAmountString(amountCents),
+    settleDate: todayDate(),
+  });
+
+  return `?${settleQuery.toString()}#record-payment`;
 }
 
 function makeId(prefix: string): string {
@@ -407,6 +422,7 @@ export function PreviewWorkspace() {
   const [paymentDate, setPaymentDate] = useState(todayDate());
   const [paymentNote, setPaymentNote] = useState("");
   const [paymentError, setPaymentError] = useState<string | null>(null);
+  const [didApplySettleParams, setDidApplySettleParams] = useState(false);
 
   useEffect(() => {
     try {
@@ -444,6 +460,50 @@ export function PreviewWorkspace() {
       setPaymentTo(fallback ?? group.members[0]?.userId ?? "");
     }
   }, [group.members, paymentFrom, paymentTo]);
+
+  useEffect(() => {
+    if (!loaded || didApplySettleParams) {
+      return;
+    }
+
+    const searchParams = new URLSearchParams(window.location.search);
+    const settleFrom = searchParams.get("settleFrom")?.trim() ?? "";
+    const settleTo = searchParams.get("settleTo")?.trim() ?? "";
+    const settleAmount = searchParams.get("settleAmount")?.trim() ?? "";
+    const settleDate = searchParams.get("settleDate")?.trim() ?? "";
+    const hasSettleParams = Boolean(settleFrom || settleTo || settleAmount || settleDate);
+
+    if (!hasSettleParams) {
+      setDidApplySettleParams(true);
+      return;
+    }
+
+    const memberIds = new Set(group.members.map((member) => member.userId));
+
+    if (memberIds.has(settleFrom)) {
+      setPaymentFrom(settleFrom);
+    }
+
+    if (memberIds.has(settleTo)) {
+      setPaymentTo(settleTo);
+    }
+
+    if (settleAmount) {
+      try {
+        parseAmountToCents(settleAmount);
+        setPaymentAmount(settleAmount);
+      } catch {
+        // Ignore invalid prefilled amount.
+      }
+    }
+
+    if (settleDate && isIsoDate(settleDate)) {
+      setPaymentDate(settleDate);
+    }
+
+    setPaymentError(null);
+    setDidApplySettleParams(true);
+  }, [didApplySettleParams, group.members, loaded]);
 
   useEffect(() => {
     if (receiptExpenseId && !group.expenses.some((expense) => expense.id === receiptExpenseId)) {
@@ -1138,18 +1198,28 @@ export function PreviewWorkspace() {
                     key={`${suggestion.fromMemberId}-${suggestion.toMemberId}-${index}`}
                     className="rounded-md border border-slate-200 px-3 py-2"
                   >
-                    <span className="font-medium">{memberNameById(group, suggestion.fromMemberId)}</span> pays{" "}
-                    <span className="font-medium">{memberNameById(group, suggestion.toMemberId)}</span>{" "}
-                    <span className="font-semibold text-slate-900">
-                      {formatCurrencyFromCents(suggestion.amountCents, group.currencyCode)}
-                    </span>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p>
+                        <span className="font-medium">{memberNameById(group, suggestion.fromMemberId)}</span> pays{" "}
+                        <span className="font-medium">{memberNameById(group, suggestion.toMemberId)}</span>{" "}
+                        <span className="font-semibold text-slate-900">
+                          {formatCurrencyFromCents(suggestion.amountCents, group.currencyCode)}
+                        </span>
+                      </p>
+                      <a
+                        href={buildSettleHref(suggestion.fromMemberId, suggestion.toMemberId, suggestion.amountCents)}
+                        className="rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                      >
+                        Settle now
+                      </a>
+                    </div>
                   </li>
                 ))}
               </ul>
             )}
           </article>
 
-          <article className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <article id="record-payment" className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
             <h2 className="text-lg font-semibold text-slate-900">Record payment</h2>
             {group.members.length < 2 ? (
               <p className="mt-3 text-sm text-slate-600">
