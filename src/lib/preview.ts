@@ -35,6 +35,19 @@ export interface PreviewExpense {
   items: PreviewExpenseItem[];
   splits: PreviewExpenseSplit[];
   createdAt: string;
+  recurrenceRuleId: string | null;
+  recurrenceDate: string | null;
+}
+
+export type PreviewRecurringCadence = "weekly" | "monthly";
+
+export interface PreviewRecurringRule {
+  id: string;
+  cadence: PreviewRecurringCadence;
+  nextExpenseDate: string;
+  templateExpense: PreviewExpense;
+  active: boolean;
+  createdAt: string;
 }
 
 export interface PreviewPayment {
@@ -54,6 +67,7 @@ export interface PreviewGroup {
   members: PreviewMember[];
   expenses: PreviewExpense[];
   payments: PreviewPayment[];
+  recurringRules: PreviewRecurringRule[];
   financialCoachByMember: Record<string, FinancialCoachSettings>;
 }
 
@@ -66,6 +80,7 @@ const DEFAULT_PREVIEW_GROUP: PreviewGroup = {
   members: [],
   expenses: [],
   payments: [],
+  recurringRules: [],
   financialCoachByMember: {},
 };
 

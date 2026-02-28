@@ -2,14 +2,12 @@ import Link from "next/link";
 
 import { createInviteAction, createPaymentAction } from "@/app/actions";
 import { DeleteExpenseButton } from "@/components/delete-expense-button";
-import { ReminderActions } from "@/components/reminder-actions";
 import { SubmitButton } from "@/components/submit-button";
 import { requireUser } from "@/lib/auth";
 import { getGroupOverview } from "@/lib/db";
 import { env } from "@/lib/env";
 import { buildInstallmentPlan } from "@/lib/installments";
 import { centsToAmountString, formatCurrencyFromCents, parseAmountToCents } from "@/lib/money";
-import { buildInstallmentReminderMessage, buildSettlementReminderMessage, joinAbsoluteUrl } from "@/lib/reminder";
 
 interface GroupPageProps {
   params: Promise<{ groupId: string }>;
@@ -231,13 +229,6 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
                     toMemberId: suggestion.toMemberId,
                     amountCents: suggestion.amountCents,
                   });
-                  const reminderMessage = buildSettlementReminderMessage({
-                    payerName,
-                    payeeName,
-                    amountLabel,
-                    groupName: overview.group.name,
-                    settleLink: joinAbsoluteUrl(env.siteUrl(), settleHref),
-                  });
                   const installmentPlans = [2, 3, 4].map((parts) => {
                     const plan = buildInstallmentPlan(suggestion.amountCents, parts, todayDate());
                     const first = plan[0];
@@ -259,20 +250,11 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
                       paymentDate: first.dueDate,
                       note: installmentNote,
                     });
-                    const installmentReminderMessage = buildInstallmentReminderMessage({
-                      payerName,
-                      payeeName,
-                      totalAmountLabel: amountLabel,
-                      groupName: overview.group.name,
-                      planSummary,
-                      firstSettleLink: joinAbsoluteUrl(env.siteUrl(), firstInstallmentHref),
-                    });
 
                     return {
                       parts,
                       planSummary,
                       firstInstallmentHref,
-                      installmentReminderMessage,
                     };
                   });
 
@@ -291,7 +273,6 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
                           Settle now
                         </Link>
                       </div>
-                      <ReminderActions message={reminderMessage} className="mt-2" />
 
                       <div className="mt-2 rounded-md bg-slate-50 p-2">
                         <p className="text-xs font-medium text-slate-700">Need flexibility? Start a weekly payment plan:</p>
@@ -306,7 +287,6 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
                                 >
                                   Start {option.parts}-part plan
                                 </Link>
-                                <ReminderActions message={option.installmentReminderMessage} />
                               </div>
                             </li>
                           ))}

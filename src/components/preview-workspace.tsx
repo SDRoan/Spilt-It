@@ -1,9 +1,9 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import { ExpenseForm } from "@/components/expense-form";
-import { ReminderActions } from "@/components/reminder-actions";
 import { computeGroupBalances } from "@/lib/balances";
 import {
   buildExpenseBalanceDelta,
@@ -18,10 +18,11 @@ import {
   PREVIEW_STORAGE_KEY,
   type FinancialCoachSettings,
   getDefaultPreviewGroup,
+  type PreviewRecurringCadence,
+  type PreviewRecurringRule,
   type PreviewExpense,
   type PreviewGroup,
 } from "@/lib/preview";
-import { buildInstallmentReminderMessage, buildSettlementReminderMessage, joinAbsoluteUrl } from "@/lib/reminder";
 import { suggestSettlements } from "@/lib/settle";
 import { computeExpenseSplit } from "@/lib/splits";
 import type { ExpensePayload } from "@/types/app";
@@ -31,6 +32,11 @@ const DEFAULT_COACH_SETTINGS: FinancialCoachSettings = {
   maxDebtCents: 20000,
   weeklyPayCapCents: 5000,
 };
+
+const RECURRING_CADENCE_OPTIONS: Array<{ value: PreviewRecurringCadence; label: string }> = [
+  { value: "weekly", label: "Weekly" },
+  { value: "monthly", label: "Monthly" },
+];
 
 function todayDate(): string {
   return new Date().toISOString().slice(0, 10);
@@ -44,33 +50,170 @@ function toReadableDate(value: string): string {
   return new Date(value).toLocaleDateString("en-US", { dateStyle: "medium" });
 }
 
-function buildSettleHref(input: {
-  fromMemberId: string;
-  toMemberId: string;
-  amountCents: number;
-  paymentDate?: string;
-  note?: string;
-}): string {
-  const settleQuery = new URLSearchParams({
-    settleFrom: input.fromMemberId,
-    settleTo: input.toMemberId,
-    settleAmount: centsToAmountString(input.amountCents),
-    settleDate: input.paymentDate && isIsoDate(input.paymentDate) ? input.paymentDate : todayDate(),
-  });
-
-  if (input.note && input.note.trim().length > 0) {
-    settleQuery.set("settleNote", input.note.trim());
-  }
-
-  return `/?${settleQuery.toString()}#record-payment`;
-}
-
 function makeId(prefix: string): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return `${prefix}-${crypto.randomUUID()}`;
   }
 
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function parseIsoDateParts(value: string): { year: number; month: number; day: number } {
+  if (!isIsoDate(value)) {
+    throw new Error("Date must be YYYY-MM-DD.");
+  }
+
+  const [yearRaw, monthRaw, dayRaw] = value.split("-");
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
+    throw new Error("Date must be YYYY-MM-DD.");
+  }
+
+  return { year, month, day };
+}
+
+function toIsoDate(value: Date): string {
+  return value.toISOString().slice(0, 10);
+}
+
+function addDaysToIsoDate(dateValue: string, days: number): string {
+  const parsed = parseIsoDateParts(dateValue);
+  const date = new Date(Date.UTC(parsed.year, parsed.month - 1, parsed.day));
+  date.setUTCDate(date.getUTCDate() + days);
+  return toIsoDate(date);
+}
+
+function daysInMonthUtc(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+function addMonthsToIsoDate(dateValue: string, months: number): string {
+  const parsed = parseIsoDateParts(dateValue);
+  const absoluteMonth = (parsed.month - 1) + months;
+  const nextYear = parsed.year + Math.floor(absoluteMonth / 12);
+  const nextMonthIndex = ((absoluteMonth % 12) + 12) % 12;
+  const nextMonth = nextMonthIndex + 1;
+  const nextDay = Math.min(parsed.day, daysInMonthUtc(nextYear, nextMonth));
+  const date = new Date(Date.UTC(nextYear, nextMonthIndex, nextDay));
+  return toIsoDate(date);
+}
+
+function advanceRecurringDate(dateValue: string, cadence: PreviewRecurringCadence): string {
+  return cadence === "weekly"
+    ? addDaysToIsoDate(dateValue, 7)
+    : addMonthsToIsoDate(dateValue, 1);
+}
+
+function normalizePreviewExpense(expense: PreviewExpense): PreviewExpense {
+  return {
+    ...expense,
+    recurrenceRuleId: typeof expense.recurrenceRuleId === "string" ? expense.recurrenceRuleId : null,
+    recurrenceDate: typeof expense.recurrenceDate === "string" && isIsoDate(expense.recurrenceDate) ? expense.recurrenceDate : null,
+  };
+}
+
+function normalizeRecurringRule(rule: PreviewRecurringRule): PreviewRecurringRule | null {
+  if (!rule || !rule.id || !isIsoDate(rule.nextExpenseDate)) {
+    return null;
+  }
+
+  if (rule.cadence !== "weekly" && rule.cadence !== "monthly") {
+    return null;
+  }
+
+  const normalizedTemplate = normalizePreviewExpense(rule.templateExpense);
+
+  return {
+    id: rule.id,
+    cadence: rule.cadence,
+    nextExpenseDate: rule.nextExpenseDate,
+    templateExpense: normalizedTemplate,
+    active: rule.active !== false,
+    createdAt: rule.createdAt || new Date().toISOString(),
+  };
+}
+
+function cloneRecurringExpense(rule: PreviewRecurringRule, expenseDate: string): PreviewExpense {
+  const itemIdMap = new Map<string, string>();
+  const items = rule.templateExpense.items.map((item) => {
+    const nextItemId = makeId("item");
+    itemIdMap.set(item.id, nextItemId);
+    return {
+      id: nextItemId,
+      name: item.name,
+      amountCents: item.amountCents,
+    };
+  });
+
+  return {
+    ...rule.templateExpense,
+    id: makeId("exp"),
+    expenseDate,
+    items,
+    splits: rule.templateExpense.splits.map((split) => ({
+      participantId: split.participantId,
+      amountCents: split.amountCents,
+      itemId: split.itemId ? (itemIdMap.get(split.itemId) ?? null) : null,
+    })),
+    createdAt: new Date().toISOString(),
+    recurrenceRuleId: rule.id,
+    recurrenceDate: expenseDate,
+  };
+}
+
+function applyRecurringRules(group: PreviewGroup, asOfDate: string): PreviewGroup {
+  if (group.recurringRules.length === 0) {
+    return group;
+  }
+
+  let didMutate = false;
+  let nextExpenses = [...group.expenses];
+
+  const nextRules = group.recurringRules.map((rule) => {
+    if (!rule.active) {
+      return rule;
+    }
+
+    let nextDate = rule.nextExpenseDate;
+    let guard = 0;
+
+    while (nextDate <= asOfDate && guard < 400) {
+      guard += 1;
+      const alreadyExists = nextExpenses.some(
+        (expense) => expense.recurrenceRuleId === rule.id && expense.recurrenceDate === nextDate,
+      );
+
+      if (!alreadyExists) {
+        nextExpenses = [cloneRecurringExpense(rule, nextDate), ...nextExpenses];
+        didMutate = true;
+      }
+
+      nextDate = advanceRecurringDate(nextDate, rule.cadence);
+    }
+
+    if (nextDate !== rule.nextExpenseDate) {
+      didMutate = true;
+      return {
+        ...rule,
+        nextExpenseDate: nextDate,
+      };
+    }
+
+    return rule;
+  });
+
+  if (!didMutate) {
+    return group;
+  }
+
+  return {
+    ...group,
+    expenses: nextExpenses,
+    recurringRules: nextRules,
+  };
 }
 
 function toMemberId(input: string): string {
@@ -473,7 +616,12 @@ export function PreviewWorkspace() {
   const [paymentNote, setPaymentNote] = useState("");
   const [paymentError, setPaymentError] = useState<string | null>(null);
   const [didApplySettleParams, setDidApplySettleParams] = useState(false);
-  const [publicBaseUrl, setPublicBaseUrl] = useState("http://localhost:3000");
+  const [recurringSourceExpenseId, setRecurringSourceExpenseId] = useState("");
+  const [recurringCadence, setRecurringCadence] = useState<PreviewRecurringCadence>("monthly");
+  const [recurringStartDate, setRecurringStartDate] = useState(todayDate());
+  const [recurringError, setRecurringError] = useState<string | null>(null);
+  const [recurringStatus, setRecurringStatus] = useState<string | null>(null);
+  const [showRecurringPanel, setShowRecurringPanel] = useState(false);
 
   const [coachMemberId, setCoachMemberId] = useState(group.members[0]?.userId ?? "");
   const [coachMonthlyBudget, setCoachMonthlyBudget] = useState(
@@ -485,6 +633,7 @@ export function PreviewWorkspace() {
   );
   const [coachError, setCoachError] = useState<string | null>(null);
   const [coachStatus, setCoachStatus] = useState<string | null>(null);
+  const [showFinancialCoachPanel, setShowFinancialCoachPanel] = useState(false);
 
   useEffect(() => {
     try {
@@ -492,10 +641,18 @@ export function PreviewWorkspace() {
       if (stored) {
         const parsed = JSON.parse(stored) as PreviewGroup;
         if (parsed && Array.isArray(parsed.members) && Array.isArray(parsed.expenses) && Array.isArray(parsed.payments)) {
-          setGroup({
+          const normalized: PreviewGroup = {
             ...parsed,
+            expenses: parsed.expenses.map((expense) => normalizePreviewExpense(expense as PreviewExpense)),
+            recurringRules: Array.isArray(parsed.recurringRules)
+              ? (parsed.recurringRules
+                  .map((rule) => normalizeRecurringRule(rule as PreviewRecurringRule))
+                  .filter((rule): rule is PreviewRecurringRule => rule !== null))
+              : [],
             financialCoachByMember: parsed.financialCoachByMember ?? {},
-          });
+          };
+
+          setGroup(applyRecurringRules(normalized, todayDate()));
         }
       }
     } catch {
@@ -512,10 +669,6 @@ export function PreviewWorkspace() {
 
     window.localStorage.setItem(PREVIEW_STORAGE_KEY, JSON.stringify(group));
   }, [group, loaded]);
-
-  useEffect(() => {
-    setPublicBaseUrl(window.location.origin);
-  }, []);
 
   useEffect(() => {
     const memberIds = new Set(group.members.map((member) => member.userId));
@@ -616,6 +769,26 @@ export function PreviewWorkspace() {
       setReceiptStatus(null);
     }
   }, [group.expenses, receiptExpenseId]);
+
+  useEffect(() => {
+    if (group.expenses.length === 0) {
+      setRecurringSourceExpenseId("");
+      setRecurringStartDate(todayDate());
+      return;
+    }
+
+    const selected = group.expenses.find((expense) => expense.id === recurringSourceExpenseId);
+    const source = selected ?? group.expenses[0];
+    if (!source) {
+      return;
+    }
+
+    if (!selected) {
+      setRecurringSourceExpenseId(source.id);
+    }
+
+    setRecurringStartDate(advanceRecurringDate(source.expenseDate, recurringCadence));
+  }, [group.expenses, recurringCadence, recurringSourceExpenseId]);
 
   const balances = useMemo(
     () =>
@@ -916,6 +1089,8 @@ export function PreviewWorkspace() {
       items,
       splits: nextSplits,
       createdAt: existingExpense?.createdAt ?? new Date().toISOString(),
+      recurrenceRuleId: existingExpense?.recurrenceRuleId ?? null,
+      recurrenceDate: existingExpense?.recurrenceDate ?? null,
     };
 
     setGroup((current) => {
@@ -1108,34 +1283,97 @@ export function PreviewWorkspace() {
     }
   }
 
-  function handleResetData(): void {
-    if (!window.confirm("Reset all local app data to defaults?")) {
+  function prefillPaymentDraft(input: {
+    fromMemberId: string;
+    toMemberId: string;
+    amountCents: number;
+    paymentDate?: string;
+    note?: string;
+  }): void {
+    const memberIds = new Set(group.members.map((member) => member.userId));
+    if (!memberIds.has(input.fromMemberId) || !memberIds.has(input.toMemberId) || input.fromMemberId === input.toMemberId) {
+      setPaymentError("Payment members must exist in the group.");
       return;
     }
 
-    const defaults = getDefaultPreviewGroup();
-    setGroup(defaults);
-    setShowExpenseForm(false);
-    setEditingExpenseId(null);
-    setPaymentFrom(defaults.members[0]?.userId ?? "");
-    setPaymentTo(defaults.members[1]?.userId ?? defaults.members[0]?.userId ?? "");
-    setPaymentAmount("");
-    setPaymentDate(todayDate());
-    setPaymentNote("");
-    setReceiptExpenseId(null);
-    setReceiptRecipientName("");
-    setReceiptTitle("");
-    setReceiptMessage("");
-    setReceiptFooter("");
-    setReceiptError(null);
-    setReceiptStatus(null);
-    setCoachMemberId(defaults.members[0]?.userId ?? "");
-    setCoachMonthlyBudget(centsToAmountString(DEFAULT_COACH_SETTINGS.monthlyBudgetCents));
-    setCoachMaxDebt(centsToAmountString(DEFAULT_COACH_SETTINGS.maxDebtCents));
-    setCoachWeeklyPayCap(centsToAmountString(DEFAULT_COACH_SETTINGS.weeklyPayCapCents));
-    setCoachError(null);
-    setCoachStatus(null);
-    window.localStorage.removeItem(PREVIEW_STORAGE_KEY);
+    setPaymentFrom(input.fromMemberId);
+    setPaymentTo(input.toMemberId);
+    setPaymentAmount(centsToAmountString(input.amountCents));
+    setPaymentDate(input.paymentDate && isIsoDate(input.paymentDate) ? input.paymentDate : todayDate());
+    setPaymentNote(input.note?.trim() ?? "");
+    setPaymentError(null);
+
+    requestAnimationFrame(() => {
+      document.getElementById("record-payment")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
+  function prefillRecurringFromExpense(expenseId: string): void {
+    const sourceExpense = group.expenses.find((expense) => expense.id === expenseId);
+    if (!sourceExpense) {
+      return;
+    }
+
+    setShowRecurringPanel(true);
+    setRecurringCadence("monthly");
+    setRecurringSourceExpenseId(sourceExpense.id);
+    setRecurringStartDate(addMonthsToIsoDate(sourceExpense.expenseDate, 1));
+    setRecurringError(null);
+    setRecurringStatus(`Ready to repeat "${sourceExpense.description}" monthly.`);
+  }
+
+  function handleCreateRecurringRule(event: React.FormEvent<HTMLFormElement>): void {
+    event.preventDefault();
+    setRecurringError(null);
+    setRecurringStatus(null);
+
+    try {
+      const sourceExpense = group.expenses.find((expense) => expense.id === recurringSourceExpenseId);
+      if (!sourceExpense) {
+        throw new Error("Choose an expense template.");
+      }
+
+      if (!isIsoDate(recurringStartDate)) {
+        throw new Error("Choose a valid next date.");
+      }
+
+      const rule: PreviewRecurringRule = {
+        id: makeId("recur"),
+        cadence: recurringCadence,
+        nextExpenseDate: recurringStartDate,
+        templateExpense: normalizePreviewExpense(sourceExpense),
+        active: true,
+        createdAt: new Date().toISOString(),
+      };
+
+      setGroup((current) =>
+        applyRecurringRules(
+          {
+            ...current,
+            recurringRules: [rule, ...current.recurringRules],
+          },
+          todayDate(),
+        ),
+      );
+
+      setRecurringStatus("Recurring expense rule created.");
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "Could not create recurring rule.";
+      setRecurringError(message);
+    }
+  }
+
+  function handleDeleteRecurringRule(ruleId: string): void {
+    if (!window.confirm("Delete this recurring expense rule?")) {
+      return;
+    }
+
+    setGroup((current) => ({
+      ...current,
+      recurringRules: current.recurringRules.filter((rule) => rule.id !== ruleId),
+    }));
+    setRecurringError(null);
+    setRecurringStatus("Recurring expense rule deleted.");
   }
 
   if (!loaded) {
@@ -1155,14 +1393,12 @@ export function PreviewWorkspace() {
             Group: {group.name}. Your changes persist locally in this browser.
           </p>
         </div>
-
-        <button
-          type="button"
-          onClick={handleResetData}
+        <Link
+          href="/settings"
           className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
         >
-          Reset data
-        </button>
+          Settings
+        </Link>
       </header>
 
       <section className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
@@ -1344,12 +1580,25 @@ export function PreviewWorkspace() {
                             {memberNameById(group, expense.paidBy)}
                           </p>
                           <p className="text-sm text-slate-600">Mode: {expense.splitMode}</p>
+                          {expense.recurrenceRuleId ? (
+                            <p className="text-xs text-slate-500">
+                              Auto-generated recurring expense
+                              {expense.recurrenceDate ? ` · ${toReadableDate(expense.recurrenceDate)}` : ""}.
+                            </p>
+                          ) : null}
                         </div>
                         <div className="text-right">
                           <p className="text-base font-semibold text-slate-900">
                             {formatCurrencyFromCents(expense.totalCents, group.currencyCode)}
                           </p>
                           <div className="mt-2 flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => prefillRecurringFromExpense(expense.id)}
+                              className="rounded-md border border-emerald-300 px-2.5 py-1 text-xs font-medium text-emerald-700"
+                            >
+                              Repeat
+                            </button>
                             <button
                               type="button"
                               onClick={() => startReceiptBuilder(expense)}
@@ -1396,107 +1645,239 @@ export function PreviewWorkspace() {
 
         <div className="space-y-6">
           <article className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-            <h2 className="text-lg font-semibold text-slate-900">Financial coach</h2>
-            <p className="mt-2 text-sm text-slate-600">
-              Set personal limits to build disciplined spending and repayment habits.
-            </p>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-lg font-semibold text-slate-900">Recurring expenses</h2>
+              <button
+                type="button"
+                onClick={() => setShowRecurringPanel((current) => !current)}
+                className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                {showRecurringPanel ? "Hide" : "Show"}
+              </button>
+            </div>
 
-            {group.members.length === 0 ? (
-              <p className="mt-3 text-sm text-slate-600">Add members to configure financial guardrails.</p>
-            ) : (
-              <form onSubmit={handleSaveCoachSettings} className="mt-3 space-y-3">
-                <label className="space-y-1 block">
-                  <span className="text-sm text-slate-700">Member</span>
-                  <select
-                    value={coachMemberId}
-                    onChange={(event) => setCoachMemberId(event.target.value)}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
-                  >
-                    {group.members.map((member) => (
-                      <option key={member.userId} value={member.userId}>
-                        {member.displayName}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <label className="space-y-1 block">
-                  <span className="text-sm text-slate-700">Monthly spend budget ({group.currencyCode})</span>
-                  <input
-                    value={coachMonthlyBudget}
-                    onChange={(event) => setCoachMonthlyBudget(event.target.value)}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
-                    placeholder="0.00"
-                  />
-                </label>
-
-                <label className="space-y-1 block">
-                  <span className="text-sm text-slate-700">Max safe debt ({group.currencyCode})</span>
-                  <input
-                    value={coachMaxDebt}
-                    onChange={(event) => setCoachMaxDebt(event.target.value)}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
-                    placeholder="0.00"
-                  />
-                </label>
-
-                <label className="space-y-1 block">
-                  <span className="text-sm text-slate-700">Weekly pay cap ({group.currencyCode})</span>
-                  <input
-                    value={coachWeeklyPayCap}
-                    onChange={(event) => setCoachWeeklyPayCap(event.target.value)}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
-                    placeholder="0.00"
-                  />
-                </label>
-
-                {coachError ? <p className="text-sm text-rose-700">{coachError}</p> : null}
-                {coachStatus ? <p className="text-sm text-emerald-700">{coachStatus}</p> : null}
-
-                <button
-                  type="submit"
-                  className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-50"
-                >
-                  Save guardrails
-                </button>
-              </form>
-            )}
-
-            {coachMemberId ? (
-              <div className="mt-3 rounded-md bg-slate-50 p-3 text-sm">
-                <p className="text-slate-700">
-                  This month spend:{" "}
-                  <span className="font-semibold">
-                    {formatCurrencyFromCents(monthlyShareSpendCents, group.currencyCode)}
-                  </span>{" "}
-                  ({monthlyUsagePercent}% of budget)
+            {showRecurringPanel ? (
+              <>
+                <p className="mt-2 text-sm text-slate-600">
+                  Reuse an existing expense as a template and auto-create it on a weekly or monthly cadence.
                 </p>
-                <p className="mt-1 text-slate-700">
-                  Current owed:{" "}
-                  <span className="font-semibold">{formatCurrencyFromCents(owedCents, group.currencyCode)}</span>{" "}
-                  / safe debt{" "}
-                  <span className="font-semibold">
-                    {formatCurrencyFromCents(selectedCoachSettings.maxDebtCents, group.currencyCode)}
-                  </span>
-                </p>
-                <p className={`mt-1 font-semibold ${scoreToneClass}`}>Responsibility score: {responsibilityScore}/100</p>
-                {owedCents > 0 ? (
-                  <p className="mt-1 text-slate-700">
-                    Weekly action: pay{" "}
-                    <span className="font-semibold">
-                      {formatCurrencyFromCents(weeklyPlan.recommendedPaymentCents, group.currencyCode)}
-                    </span>{" "}
-                    by {new Date(weeklyPlan.dueDate).toLocaleDateString("en-US", { dateStyle: "medium" })}. At this pace, clear debt in{" "}
-                    <span className="font-semibold">{weeklyPlan.weeksToClear}</span> week
-                    {weeklyPlan.weeksToClear === 1 ? "" : "s"}.
-                  </p>
+
+                {group.expenses.length === 0 ? (
+                  <p className="mt-3 text-sm text-slate-600">Add at least one expense before creating a recurring rule.</p>
                 ) : (
-                  <p className="mt-1 text-slate-700">
-                    Weekly action: no debt right now. Keep spending under budget and keep your streak.
-                  </p>
+                  <form onSubmit={handleCreateRecurringRule} className="mt-3 space-y-3">
+                    <label className="block space-y-1">
+                      <span className="text-sm text-slate-700">Template expense</span>
+                      <select
+                        value={recurringSourceExpenseId}
+                        onChange={(event) => setRecurringSourceExpenseId(event.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                      >
+                        {sortedExpenses.map((expense) => (
+                          <option key={expense.id} value={expense.id}>
+                            {expense.description} · {toReadableDate(expense.expenseDate)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <label className="block space-y-1">
+                        <span className="text-sm text-slate-700">Cadence</span>
+                        <select
+                          value={recurringCadence}
+                          onChange={(event) => setRecurringCadence(event.target.value as PreviewRecurringCadence)}
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                        >
+                          {RECURRING_CADENCE_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label className="block space-y-1">
+                        <span className="text-sm text-slate-700">Next expense date</span>
+                        <input
+                          type="date"
+                          value={recurringStartDate}
+                          onChange={(event) => setRecurringStartDate(event.target.value)}
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                        />
+                      </label>
+                    </div>
+
+                    {recurringError ? <p className="text-sm text-rose-700">{recurringError}</p> : null}
+                    {recurringStatus ? <p className="text-sm text-emerald-700">{recurringStatus}</p> : null}
+
+                    <button
+                      type="submit"
+                      className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-50"
+                    >
+                      Create recurring rule
+                    </button>
+                  </form>
                 )}
-              </div>
-            ) : null}
+
+                <div className="mt-4">
+                  <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">Active rules</h3>
+                  {group.recurringRules.length === 0 ? (
+                    <p className="mt-2 text-sm text-slate-600">No recurring rules yet.</p>
+                  ) : (
+                    <ul className="mt-2 space-y-2 text-sm">
+                      {[...group.recurringRules]
+                        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+                        .map((rule) => (
+                          <li key={rule.id} className="rounded-md border border-slate-200 px-3 py-2">
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <p className="font-medium text-slate-900">{rule.templateExpense.description}</p>
+                                <p className="text-slate-600">
+                                  {rule.cadence === "weekly" ? "Weekly" : "Monthly"} · next {toReadableDate(rule.nextExpenseDate)}
+                                </p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteRecurringRule(rule.id)}
+                                className="rounded-md border border-rose-200 px-2.5 py-1 text-xs font-medium text-rose-700"
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          </li>
+                        ))}
+                    </ul>
+                  )}
+                </div>
+              </>
+            ) : (
+              <p className="mt-2 text-sm text-slate-600">
+                Hidden. Open this section when you want to manage recurring rules.
+              </p>
+            )}
+          </article>
+
+          <article className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-lg font-semibold text-slate-900">Financial coach</h2>
+              <button
+                type="button"
+                onClick={() => setShowFinancialCoachPanel((current) => !current)}
+                className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                {showFinancialCoachPanel ? "Hide" : "Show"}
+              </button>
+            </div>
+
+            {showFinancialCoachPanel ? (
+              <>
+                <p className="mt-2 text-sm text-slate-600">
+                  Set personal limits to build disciplined spending and repayment habits.
+                </p>
+
+                {group.members.length === 0 ? (
+                  <p className="mt-3 text-sm text-slate-600">Add members to configure financial guardrails.</p>
+                ) : (
+                  <form onSubmit={handleSaveCoachSettings} className="mt-3 space-y-3">
+                    <label className="space-y-1 block">
+                      <span className="text-sm text-slate-700">Member</span>
+                      <select
+                        value={coachMemberId}
+                        onChange={(event) => setCoachMemberId(event.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                      >
+                        {group.members.map((member) => (
+                          <option key={member.userId} value={member.userId}>
+                            {member.displayName}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="space-y-1 block">
+                      <span className="text-sm text-slate-700">Monthly spend budget ({group.currencyCode})</span>
+                      <input
+                        value={coachMonthlyBudget}
+                        onChange={(event) => setCoachMonthlyBudget(event.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                        placeholder="0.00"
+                      />
+                    </label>
+
+                    <label className="space-y-1 block">
+                      <span className="text-sm text-slate-700">Max safe debt ({group.currencyCode})</span>
+                      <input
+                        value={coachMaxDebt}
+                        onChange={(event) => setCoachMaxDebt(event.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                        placeholder="0.00"
+                      />
+                    </label>
+
+                    <label className="space-y-1 block">
+                      <span className="text-sm text-slate-700">Weekly pay cap ({group.currencyCode})</span>
+                      <input
+                        value={coachWeeklyPayCap}
+                        onChange={(event) => setCoachWeeklyPayCap(event.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                        placeholder="0.00"
+                      />
+                    </label>
+
+                    {coachError ? <p className="text-sm text-rose-700">{coachError}</p> : null}
+                    {coachStatus ? <p className="text-sm text-emerald-700">{coachStatus}</p> : null}
+
+                    <button
+                      type="submit"
+                      className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-50"
+                    >
+                      Save guardrails
+                    </button>
+                  </form>
+                )}
+
+                {coachMemberId ? (
+                  <div className="mt-3 rounded-md bg-slate-50 p-3 text-sm">
+                    <p className="text-slate-700">
+                      This month spend:{" "}
+                      <span className="font-semibold">
+                        {formatCurrencyFromCents(monthlyShareSpendCents, group.currencyCode)}
+                      </span>{" "}
+                      ({monthlyUsagePercent}% of budget)
+                    </p>
+                    <p className="mt-1 text-slate-700">
+                      Current owed:{" "}
+                      <span className="font-semibold">{formatCurrencyFromCents(owedCents, group.currencyCode)}</span>{" "}
+                      / safe debt{" "}
+                      <span className="font-semibold">
+                        {formatCurrencyFromCents(selectedCoachSettings.maxDebtCents, group.currencyCode)}
+                      </span>
+                    </p>
+                    <p className={`mt-1 font-semibold ${scoreToneClass}`}>Responsibility score: {responsibilityScore}/100</p>
+                    {owedCents > 0 ? (
+                      <p className="mt-1 text-slate-700">
+                        Weekly action: pay{" "}
+                        <span className="font-semibold">
+                          {formatCurrencyFromCents(weeklyPlan.recommendedPaymentCents, group.currencyCode)}
+                        </span>{" "}
+                        by {new Date(weeklyPlan.dueDate).toLocaleDateString("en-US", { dateStyle: "medium" })}. At this pace, clear debt in{" "}
+                        <span className="font-semibold">{weeklyPlan.weeksToClear}</span> week
+                        {weeklyPlan.weeksToClear === 1 ? "" : "s"}.
+                      </p>
+                    ) : (
+                      <p className="mt-1 text-slate-700">
+                        Weekly action: no debt right now. Keep spending under budget and keep your streak.
+                      </p>
+                    )}
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <p className="mt-2 text-sm text-slate-600">
+                Hidden. Open this section when you want to configure or view financial coach details.
+              </p>
+            )}
           </article>
 
           <article className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
@@ -1528,18 +1909,6 @@ export function PreviewWorkspace() {
                   const payerName = memberNameById(group, suggestion.fromMemberId);
                   const payeeName = memberNameById(group, suggestion.toMemberId);
                   const amountLabel = formatCurrencyFromCents(suggestion.amountCents, group.currencyCode);
-                  const settleHref = buildSettleHref({
-                    fromMemberId: suggestion.fromMemberId,
-                    toMemberId: suggestion.toMemberId,
-                    amountCents: suggestion.amountCents,
-                  });
-                  const reminderMessage = buildSettlementReminderMessage({
-                    payerName,
-                    payeeName,
-                    amountLabel,
-                    groupName: group.name,
-                    settleLink: joinAbsoluteUrl(publicBaseUrl, settleHref),
-                  });
                   const installmentPlans = [2, 3, 4].map((parts) => {
                     const plan = buildInstallmentPlan(suggestion.amountCents, parts, todayDate());
                     const first = plan[0];
@@ -1554,27 +1923,13 @@ export function PreviewWorkspace() {
                       )
                       .join("; ");
                     const installmentNote = `Installment 1/${parts} of ${amountLabel} settlement`;
-                    const firstInstallmentHref = buildSettleHref({
-                      fromMemberId: suggestion.fromMemberId,
-                      toMemberId: suggestion.toMemberId,
-                      amountCents: first.amountCents,
-                      paymentDate: first.dueDate,
-                      note: installmentNote,
-                    });
-                    const installmentReminderMessage = buildInstallmentReminderMessage({
-                      payerName,
-                      payeeName,
-                      totalAmountLabel: amountLabel,
-                      groupName: group.name,
-                      planSummary,
-                      firstSettleLink: joinAbsoluteUrl(publicBaseUrl, firstInstallmentHref),
-                    });
 
                     return {
                       parts,
                       planSummary,
-                      firstInstallmentHref,
-                      installmentReminderMessage,
+                      firstInstallmentAmountCents: first.amountCents,
+                      firstInstallmentDate: first.dueDate,
+                      installmentNote,
                     };
                   });
 
@@ -1589,14 +1944,20 @@ export function PreviewWorkspace() {
                           <span className="font-medium">{payeeName}</span>{" "}
                           <span className="font-semibold text-slate-900">{amountLabel}</span>
                         </p>
-                        <a
-                          href={settleHref}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            prefillPaymentDraft({
+                              fromMemberId: suggestion.fromMemberId,
+                              toMemberId: suggestion.toMemberId,
+                              amountCents: suggestion.amountCents,
+                            })
+                          }
                           className="rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
                         >
                           Settle now
-                        </a>
+                        </button>
                       </div>
-                      <ReminderActions message={reminderMessage} className="mt-2" />
 
                       <div className="mt-2 rounded-md bg-slate-50 p-2">
                         <p className="text-xs font-medium text-slate-700">Need flexibility? Start a weekly payment plan:</p>
@@ -1605,13 +1966,21 @@ export function PreviewWorkspace() {
                             <li key={option.parts} className="rounded-md border border-slate-200 bg-white px-2 py-1.5">
                               <p className="text-xs text-slate-600">{option.planSummary}</p>
                               <div className="mt-1 flex flex-wrap items-center gap-2">
-                                <a
-                                  href={option.firstInstallmentHref}
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    prefillPaymentDraft({
+                                      fromMemberId: suggestion.fromMemberId,
+                                      toMemberId: suggestion.toMemberId,
+                                      amountCents: option.firstInstallmentAmountCents,
+                                      paymentDate: option.firstInstallmentDate,
+                                      note: option.installmentNote,
+                                    })
+                                  }
                                   className="rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
                                 >
                                   Start {option.parts}-part plan
-                                </a>
-                                <ReminderActions message={option.installmentReminderMessage} />
+                                </button>
                               </div>
                             </li>
                           ))}
