@@ -2,11 +2,13 @@ import Link from "next/link";
 
 import { createInviteAction, createPaymentAction } from "@/app/actions";
 import { DeleteExpenseButton } from "@/components/delete-expense-button";
+import { ReminderActions } from "@/components/reminder-actions";
 import { SubmitButton } from "@/components/submit-button";
 import { requireUser } from "@/lib/auth";
 import { getGroupOverview } from "@/lib/db";
 import { env } from "@/lib/env";
 import { centsToAmountString, formatCurrencyFromCents, parseAmountToCents } from "@/lib/money";
+import { buildSettlementReminderMessage, joinAbsoluteUrl } from "@/lib/reminder";
 
 interface GroupPageProps {
   params: Promise<{ groupId: string }>;
@@ -204,25 +206,38 @@ export default async function GroupPage({ params, searchParams }: GroupPageProps
               <p className="mt-3 text-sm text-slate-600">Everyone is settled.</p>
             ) : (
               <ul className="mt-3 space-y-2 text-sm">
-                {overview.suggestions.map((suggestion, index) => (
-                  <li key={`${suggestion.fromMemberId}-${suggestion.toMemberId}-${index}`} className="rounded-md border border-slate-200 px-3 py-2">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <p>
-                        <span className="font-medium">{memberNameById.get(suggestion.fromMemberId) ?? "Unknown"}</span> pays{" "}
-                        <span className="font-medium">{memberNameById.get(suggestion.toMemberId) ?? "Unknown"}</span>{" "}
-                        <span className="font-semibold text-slate-900">
-                          {formatCurrencyFromCents(suggestion.amountCents, overview.group.currencyCode)}
-                        </span>
-                      </p>
-                      <Link
-                        href={buildSettleHref(suggestion.fromMemberId, suggestion.toMemberId, suggestion.amountCents)}
-                        className="rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
-                      >
-                        Settle now
-                      </Link>
-                    </div>
-                  </li>
-                ))}
+                {overview.suggestions.map((suggestion, index) => {
+                  const payerName = memberNameById.get(suggestion.fromMemberId) ?? "Unknown";
+                  const payeeName = memberNameById.get(suggestion.toMemberId) ?? "Unknown";
+                  const amountLabel = formatCurrencyFromCents(suggestion.amountCents, overview.group.currencyCode);
+                  const settleHref = buildSettleHref(suggestion.fromMemberId, suggestion.toMemberId, suggestion.amountCents);
+                  const reminderMessage = buildSettlementReminderMessage({
+                    payerName,
+                    payeeName,
+                    amountLabel,
+                    groupName: overview.group.name,
+                    settleLink: joinAbsoluteUrl(env.siteUrl(), settleHref),
+                  });
+
+                  return (
+                    <li key={`${suggestion.fromMemberId}-${suggestion.toMemberId}-${index}`} className="rounded-md border border-slate-200 px-3 py-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p>
+                          <span className="font-medium">{payerName}</span> pays{" "}
+                          <span className="font-medium">{payeeName}</span>{" "}
+                          <span className="font-semibold text-slate-900">{amountLabel}</span>
+                        </p>
+                        <Link
+                          href={settleHref}
+                          className="rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                        >
+                          Settle now
+                        </Link>
+                      </div>
+                      <ReminderActions message={reminderMessage} className="mt-2" />
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </article>

@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { ExpenseForm } from "@/components/expense-form";
+import { ReminderActions } from "@/components/reminder-actions";
 import { computeGroupBalances } from "@/lib/balances";
 import { centsToAmountString, formatCurrencyFromCents, parseAmountToCents } from "@/lib/money";
 import {
@@ -11,6 +12,7 @@ import {
   type PreviewExpense,
   type PreviewGroup,
 } from "@/lib/preview";
+import { buildSettlementReminderMessage, joinAbsoluteUrl } from "@/lib/reminder";
 import { suggestSettlements } from "@/lib/settle";
 import { computeExpenseSplit } from "@/lib/splits";
 import type { ExpensePayload } from "@/types/app";
@@ -31,7 +33,7 @@ function buildSettleHref(fromMemberId: string, toMemberId: string, amountCents: 
     settleDate: todayDate(),
   });
 
-  return `?${settleQuery.toString()}#record-payment`;
+  return `/?${settleQuery.toString()}#record-payment`;
 }
 
 function makeId(prefix: string): string {
@@ -423,6 +425,7 @@ export function PreviewWorkspace() {
   const [paymentNote, setPaymentNote] = useState("");
   const [paymentError, setPaymentError] = useState<string | null>(null);
   const [didApplySettleParams, setDidApplySettleParams] = useState(false);
+  const [publicBaseUrl, setPublicBaseUrl] = useState("http://localhost:3000");
 
   useEffect(() => {
     try {
@@ -447,6 +450,10 @@ export function PreviewWorkspace() {
 
     window.localStorage.setItem(PREVIEW_STORAGE_KEY, JSON.stringify(group));
   }, [group, loaded]);
+
+  useEffect(() => {
+    setPublicBaseUrl(window.location.origin);
+  }, []);
 
   useEffect(() => {
     const memberIds = new Set(group.members.map((member) => member.userId));
@@ -1193,28 +1200,41 @@ export function PreviewWorkspace() {
               <p className="mt-3 text-sm text-slate-600">Everyone is settled.</p>
             ) : (
               <ul className="mt-3 space-y-2 text-sm">
-                {suggestions.map((suggestion, index) => (
-                  <li
-                    key={`${suggestion.fromMemberId}-${suggestion.toMemberId}-${index}`}
-                    className="rounded-md border border-slate-200 px-3 py-2"
-                  >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <p>
-                        <span className="font-medium">{memberNameById(group, suggestion.fromMemberId)}</span> pays{" "}
-                        <span className="font-medium">{memberNameById(group, suggestion.toMemberId)}</span>{" "}
-                        <span className="font-semibold text-slate-900">
-                          {formatCurrencyFromCents(suggestion.amountCents, group.currencyCode)}
-                        </span>
-                      </p>
-                      <a
-                        href={buildSettleHref(suggestion.fromMemberId, suggestion.toMemberId, suggestion.amountCents)}
-                        className="rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
-                      >
-                        Settle now
-                      </a>
-                    </div>
-                  </li>
-                ))}
+                {suggestions.map((suggestion, index) => {
+                  const payerName = memberNameById(group, suggestion.fromMemberId);
+                  const payeeName = memberNameById(group, suggestion.toMemberId);
+                  const amountLabel = formatCurrencyFromCents(suggestion.amountCents, group.currencyCode);
+                  const settleHref = buildSettleHref(suggestion.fromMemberId, suggestion.toMemberId, suggestion.amountCents);
+                  const reminderMessage = buildSettlementReminderMessage({
+                    payerName,
+                    payeeName,
+                    amountLabel,
+                    groupName: group.name,
+                    settleLink: joinAbsoluteUrl(publicBaseUrl, settleHref),
+                  });
+
+                  return (
+                    <li
+                      key={`${suggestion.fromMemberId}-${suggestion.toMemberId}-${index}`}
+                      className="rounded-md border border-slate-200 px-3 py-2"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p>
+                          <span className="font-medium">{payerName}</span> pays{" "}
+                          <span className="font-medium">{payeeName}</span>{" "}
+                          <span className="font-semibold text-slate-900">{amountLabel}</span>
+                        </p>
+                        <a
+                          href={settleHref}
+                          className="rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                        >
+                          Settle now
+                        </a>
+                      </div>
+                      <ReminderActions message={reminderMessage} className="mt-2" />
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </article>
